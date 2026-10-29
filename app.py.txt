@@ -1,0 +1,129 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import timedelta
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+
+st.set_page_config(page_title="PCIPL MI Platform", layout="wide")
+
+@st.cache_data
+def load_historical_data():
+    try:
+        xls = pd.ExcelFile('AA_MDI_Price_Intelligence_2023_2024.xlsx')
+        data = {}
+
+        products = [
+            ("Acetic Acid (Glacial 99.8%)", "📅 AA Weekly+Factors", "64-19-7", "CFR India"),
+            ("MDI (Polymeric)", "📅 MDI Weekly+Factors", "9016-87-9", "CFR India")
+        ]
+
+        for name, sheet, cas, basis in products:
+            df = pd.read_excel(xls, sheet_name=sheet, skiprows=6, header=None)
+            clean_data = []
+            for _, row in df.iterrows():
+                if pd.isna(row[2]): continue
+                clean_data.append({
+                    'obs_date': pd.to_datetime(row[2]),
+                    'wk_avg': float(row[5]) if not pd.isna(row[5]) else np.nan,
+                    'pt_score': int(row[14]) if not pd.isna(row[14]) else 0,
+                    'sd_score': int(row[16]) if not pd.isna(row[16]) else 0,
+                    'dd_score': int(row[18]) if not pd.isna(row[18]) else 0,
+                    'cs_score': int(row[20]) if not pd.isna(row[20]) else 0,
+                    'cd_score': int(row[22]) if not pd.isna(row[22]) else 0,
+                    'fe_score': int(row[24]) if not pd.isna(row[24]) else 0,
+                    'oe_score': int(row[26]) if not pd.isna(row[26]) else 0,
+                })
+
+            pdf = pd.DataFrame(clean_data).dropna(subset=['wk_avg']).sort_values('obs_date')
+            pdf['4wk_avg'] = pdf['wk_avg'].rolling(4).mean()
+            data[name] = {'df': pdf, 'cas': cas, 'basis': basis}
+
+        return data
+    except Exception as e:
+        return None
+
+def generate_forecast(df):
+    if len(df) < 10: return None, 0
+
+    df = df.copy()
+    df['Price_Lag1'] = df['wk_avg'].shift(1)
+    train_df = df.dropna().copy()
+
+    X = train_df[['pt_score', 'sd_score', 'dd_score', 'cs_score', 'cd_score', 'fe_score', 'oe_score', 'Price_Lag1']]
+    y = train_df['wk_avg']
+
+    model = Ridge(alpha=1.0)
+    model.fit(X, y)
+    preds = model.predict(X)
+    rmse = np.sqrt(mean_squared_error(y, preds))
+
+    last_row = train_df.iloc[-1]
+    base_factors = last_row[['pt_score', 'sd_score', 'dd_score', 'cs_score', 'cd_score', 'fe_score', 'oe_score']].values
+    last_price = last_row['wk_avg']
+
+    base_x = np.append(base_factors, last_price).reshape(1, -1)
+    bull_x = np.append(np.clip(base_factors + np.array([0, 1, 0, 0, 1, 0, 0]), -2, 2), last_price).reshape(1, -1)
+    bear_x = np.append(np.clip(base_factors + np.array([0, 0, -1, 0, -1, 0, 0]), -2, 2), last_price).reshape(1, -1)
+
+    return {
+        'Base': model.predict(base_x)[0], 'Bull': model.predict(bull_x)[0], 'Bear': model.predict(bear_x)[0]
+    }, rmse
+
+# --- UI Rendering ---
+db = load_historical_data()
+
+st.sidebar.title("⚙️ PCIPL MI Platform")
+if not db:
+    st.error("Please upload 'AA_MDI_Price_Intelligence_2023_2024.xlsx' to the repository.")
+    st.stop()
+
+selected_prod = st.sidebar.selectbox("Select Product Context", list(db.keys()))
+prod_data = db[selected_prod]
+df = prod_data['df']
+
+latest = df.iloc[-1]
+prev = df.iloc[-2]
+comp_score = sum([latest['pt_score'], latest['sd_score'], latest['dd_score'], latest['cs_score'], latest['cd_score'], latest['fe_score'], latest['oe_score']])
+
+scenarios, rmse = generate_forecast(df)
+
+st.title(f"{selected_prod} — Weekly MI Dashboard")
+st.caption(f"CAS: {prod_data['cas']} | Basis: {prod_data['basis']} | Latest Obs: {latest['obs_date'].strftime('%Y-%m-%d')}")
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Latest Price (CFR)", f"${latest['wk_avg']:.1f}/MT", f"{latest['wk_avg'] - prev['wk_avg']:.1f} WoW")
+m2.metric("4-Week Rolling Avg", f"${latest['4wk_avg']:.1f}/MT")
+m3.metric("Composite Factor Score", f"{comp_score:+.0f}", "Bullish ↑" if comp_score > 1 else "Bearish ↓" if comp_score < -1 else "Neutral →")
+m4.metric("Decision Flag", "Consider Stock-in" if comp_score >= 2 else "Hold / Delay" if comp_score <= -2 else "Spot Purchases")
+if scenarios: m5.metric("Model RMSE (Fit)", f"${rmse:.1f}/MT")
+
+st.markdown("---")
+c1, c2 = st.columns([2, 1])
+
+with c1:
+    st.subheader("Historical Price Trend & Forecast")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['obs_date'], y=df['wk_avg'], mode='lines', name='Market Avg', line=dict(color='#185FA5', width=2)))
+    fig.add_trace(go.Scatter(x=df['obs_date'], y=df['4wk_avg'], mode='lines', name='4-Wk Roll', line=dict(color='#E85D24', width=2, dash='dot')))
+    if scenarios:
+        future_date = latest['obs_date'] + timedelta(days=7)
+        fig.add_trace(go.Scatter(x=[latest['obs_date'], future_date], y=[latest['wk_avg'], scenarios['Bull']], name='Bull', line=dict(color='#1D9E75', dash='dash')))
+        fig.add_trace(go.Scatter(x=[latest['obs_date'], future_date], y=[latest['wk_avg'], scenarios['Base']], name='Base', line=dict(color='#0C447C', dash='dash')))
+        fig.add_trace(go.Scatter(x=[latest['obs_date'], future_date], y=[latest['wk_avg'], scenarios['Bear']], name='Bear', line=dict(color='#E24B4A', dash='dash')))
+    fig.update_layout(height=350, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor='rgba(240,240,240,0.5)')
+    st.plotly_chart(fig, use_container_width=True)
+
+with c2:
+    st.subheader("Forecast Outputs (t+1 wk)")
+    if scenarios:
+        st.info(f"**Base Scenario:** ${scenarios['Base']:.1f}/MT\n\n*Assumption: Market drivers remain steady.*")
+        st.success(f"**Bull Scenario:** ${scenarios['Bull']:.1f}/MT\n\n*Assumption: Increased cost/supply pressure.*")
+        st.error(f"**Bear Scenario:** ${scenarios['Bear']:.1f}/MT\n\n*Assumption: Demand drops, costs ease.*")
+
+st.subheader("Weekly Factor Scores Matrix")
+cols = st.columns(7)
+factors = [("Policy & Trade", latest['pt_score']), ("Supply Disruption", latest['sd_score']), ("Demand Dynamics", latest['dd_score']), ("Crisis Situation", latest['cs_score']), ("Cost Drivers", latest['cd_score']), ("Financial & FX", latest['fe_score']), ("Other Exception", latest['oe_score'])]
+for i, (name, score) in enumerate(factors):
+    cols[i].metric(name, f"{score:+.0f}")
